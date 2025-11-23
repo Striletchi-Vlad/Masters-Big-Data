@@ -1,0 +1,88 @@
+  **Project Code Explanation**
+
+  This project is a real-time IoT anomaly detection system built using a microservices architecture. Below is a detailed breakdown of each
+  component and its code.
+  ---
+
+  **1. Architecture Overview**
+
+  The data flows in the following pipeline:
+  1. Producer generates synthetic sensor data.
+  2. Kafka ingests this data into the sensors.raw topic.
+  3. Detector consumes raw data, runs an Isolation Forest model to detect anomalies, and:
+      • Publishes results to sensors.anomalies.
+      • Batches raw data and writes it to HDFS for storage.
+  4. Dashboard visualizes the real-time stream and reads historical data from HDFS.
+
+  ---
+
+  **2. Infrastructure (`docker-compose.yml`)**
+
+  This file orchestrates the entire system using Docker containers.
+  • `zookeeper` & `kafka`:
+      • Uses confluentinc/cp-zookeeper and confluentinc/cp-kafka images.
+      • Zookeeper manages the Kafka cluster state.
+      • Kafka is the message broker. It exposes port 9092 internally for services and externally for debugging.
+  • `namenode` & `datanode`:
+      • Standard Hadoop HDFS images (bde2020/hadoop-*).
+      • Namenode (port 9870) manages file metadata.
+      • Datanode stores the actual data blocks.
+      • They share a hadoop.env file for configuration (like permissions).
+  • Custom Services:
+      • producer, detector, dashboard: These are built from local Dockerfiles located in src/.
+      • They connect to the bigdata_net network to communicate with Kafka and Hadoop.
+
+  ---
+
+  **3. Data Producer (`src/producers/main.py`)**
+
+  This script simulates IoT devices sending data.
+  • `create_producer()`: Establishes a connection to Kafka. It retries every 5 seconds if Kafka isn't ready yet.
+  • `generate_sensor_data(sensor_id, sensor_type)`:
+      • Temperature: Normal range 20-30°C. Adds random noise. 5% chance to inject a massive spike (+/- 15°C).
+      • Vibration: Normal range 0-10Hz. 5% chance to inject a spike (+20Hz).
+      • Returns a dictionary with sensor_id, timestamp, and value.
+  • `main()`:
+      • Enters an infinite loop.
+      • Generates data for two sensors (sensor_temp_01, sensor_vib_01).
+      • Sends data to the Kafka topic sensors.raw.
+      • Sleeps for 0.1s to simulate a stream of ~20 events/sec (10 per sensor).
+
+  ---
+
+  **4. Anomaly Detector (`src/detector/main.py`)**
+
+  This is the core processing engine.
+  • `create_kafka_client()`: Connects as both a Consumer (to read raw data) and a Producer (to write results).
+  • `get_hdfs_client()`: Connects to HDFS using the insecure client (standard for dev/test Hadoop setups).
+  • `AnomalyDetector` Class:
+      • `train()`: Uses sklearn.ensemble.IsolationForest. It trains a separate model for each sensor_type. It needs at least 100 data points to
+        train.
+      • `predict()`: Returns 1 if the model thinks it's an anomaly, 0 otherwise.
+      • `update()`: Adds new data to a rolling buffer. Every 100 points (or if no model exists), it retrains the model. This makes the system
+        adaptive to changing data patterns.
+  • `main()`:
+      • Reads messages from sensors.raw.
+      • Calls detector.update() to get the anomaly status.
+      • Adds an is_anomaly field to the record.
+      • Real-time path: Sends the enriched record to sensors.anomalies.
+      • Batch path: Appends records to a local list batch_data. When the batch reaches 100 records, it writes them to a file in HDFS (e.g.,
+        /sensors_data_1715001234.json).
+
+  ---
+
+  **5. Dashboard (`src/dashboard/app.py`)**
+
+  A web interface built with Streamlit.
+  • Setup: Connects to Kafka and HDFS. Sets up two tabs.
+  • Tab 1: Real-Time Monitoring:
+      • Uses a KafkaConsumer with a unique group ID (so it always sees the latest data).
+      • Polls for new messages every 0.5s.
+      • Updates a st.session_state.data_buffer (keeping the last 500 points).
+      • Uses Plotly Express (px.line) to draw live charts.
+      • Overlays red dots for anomalies (go.Scatter).
+  • Tab 2: Batch Analysis (HDFS):
+      • `read_hdfs_data()`: Connects to HDFS, lists files starting with sensors_data_, and reads the last 5 files (to keep the demo fast).
+      • Displays the raw dataframe.
+      • Plots histograms (px.histogram) to show the distribution of values for normal vs. anomalous data.
+      • Shows a statistical summary table of anomalies.
