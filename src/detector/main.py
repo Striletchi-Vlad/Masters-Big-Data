@@ -60,16 +60,11 @@ class AnomalyDetector:
         self.data_buffers = {} # one per sensor_type
         self.min_train_size = 100
         self.max_buffer_size = 1000
+        self.feature_names = ['value', 'rolling_mean', 'rolling_std', 'velocity', 'acceleration', 'local_z']
         
     def extract_features(self, data):
         """
         Generates advanced features from the single value stream.
-        Features:
-        1. Value: Raw value
-        2. Rolling Mean: Trend component
-        3. Rolling Std: Volatility component
-        4. Velocity: Rate of change (First derivative)
-        5. Acceleration: Rate of change of velocity (Second derivative)
         """
         df = pd.DataFrame(data, columns=['value'])
         
@@ -85,15 +80,12 @@ class AnomalyDetector:
         df['acceleration'] = df['velocity'].diff()
         
         # 3. Statistical Deviations
-        # Distance from local mean normalized by local std (local z-score)
-        # Add epsilon to avoid division by zero
         df['local_z'] = (df['value'] - df['rolling_mean']) / (df['rolling_std'] + 1e-6)
         
         # Fill NaN values (caused by windowing/diff)
-        # Backfill first, then fill remaining with 0
         df = df.fillna(method='bfill').fillna(0)
         
-        return df[['value', 'rolling_mean', 'rolling_std', 'velocity', 'acceleration', 'local_z']].values
+        return df[self.feature_names].values
 
     def train(self, sensor_type, data):
         if len(data) < self.min_train_size:
@@ -107,22 +99,31 @@ class AnomalyDetector:
         self.models[sensor_type] = model
         logger.info(f"Retrained model for {sensor_type} with {len(data)} samples")
         
-    def predict(self, sensor_type):
-        if sensor_type not in self.models:
-            return 0 # Unknown status
+    def predict_and_get_features(self, sensor_type):
+        """
+        Returns (is_anomaly, latest_features_dict)
+        """
+        if sensor_type not in self.data_buffers:
+            return 0, {}
             
         data = self.data_buffers[sensor_type]
-        if len(data) < 15: # Need enough history for features
-            return 0
-            
-        # Get features for the most recent point
-        # We process the whole buffer to get correct rolling values for the last point
-        X_full = self.extract_features(data)
-        X_latest = X_full[-1].reshape(1, -1)
         
-        # Isolation Forest returns -1 for anomaly, 1 for normal
+        # Get features for the most recent point
+        X_full = self.extract_features(data)
+        latest_features_vec = X_full[-1]
+        
+        # Create dict for dashboard
+        latest_features = dict(zip(self.feature_names, latest_features_vec))
+        
+        # Predict
+        if sensor_type not in self.models or len(data) < 15:
+            return 0, latest_features
+            
+        X_latest = latest_features_vec.reshape(1, -1)
         pred = self.models[sensor_type].predict(X_latest)[0]
-        return 1 if pred == -1 else 0
+        is_anomaly = 1 if pred == -1 else 0
+        
+        return is_anomaly, latest_features
 
     def update(self, sensor_type, value):
         if sensor_type not in self.data_buffers:
@@ -138,7 +139,7 @@ class AnomalyDetector:
         if sensor_type not in self.models or len(self.data_buffers[sensor_type]) % 100 == 0:
             self.train(sensor_type, self.data_buffers[sensor_type])
             
-        return self.predict(sensor_type)
+        return self.predict_and_get_features(sensor_type)
 
 def main():
     consumer, producer = create_kafka_client()
@@ -158,9 +159,11 @@ def main():
         
         if sensor_type and value is not None:
             # Update detector with new value
-            is_anomaly = detector.update(sensor_type, value)
+            is_anomaly, features = detector.update(sensor_type, value)
             
             record['is_anomaly'] = int(is_anomaly)
+            # Merge calculated features into the record
+            record.update(features)
             
             # Send to anomalies topic
             producer.send(OUTPUT_TOPIC, value=record)
@@ -171,7 +174,6 @@ def main():
             if len(batch_data) >= BATCH_SIZE:
                 try:
                     # Write to HDFS
-                    # Create a filename with timestamp
                     filename = f"/sensors_data_{int(time.time())}.json"
                     with hdfs_client.write(filename, encoding='utf-8') as writer:
                         json.dump(batch_data, writer)
@@ -179,10 +181,8 @@ def main():
                     batch_data = []
                 except Exception as e:
                     logger.error(f"Failed to write to HDFS: {e}")
-                    # Keep buffer? Or drop to avoid memory leak? 
-                    # For now, we keep and retry next loop or drop if too big.
                     if len(batch_data) > 1000:
-                        batch_data = [] # Drop if stuck
+                        batch_data = []
 
 if __name__ == '__main__':
     main()
