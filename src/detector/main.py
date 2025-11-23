@@ -61,25 +61,68 @@ class AnomalyDetector:
         self.min_train_size = 100
         self.max_buffer_size = 1000
         
+    def extract_features(self, data):
+        """
+        Generates advanced features from the single value stream.
+        Features:
+        1. Value: Raw value
+        2. Rolling Mean: Trend component
+        3. Rolling Std: Volatility component
+        4. Velocity: Rate of change (First derivative)
+        5. Acceleration: Rate of change of velocity (Second derivative)
+        """
+        df = pd.DataFrame(data, columns=['value'])
+        
+        # Window size for rolling stats
+        window = 10
+        
+        # 1. Rolling Statistics
+        df['rolling_mean'] = df['value'].rolling(window=window).mean()
+        df['rolling_std'] = df['value'].rolling(window=window).std()
+        
+        # 2. Derivatives
+        df['velocity'] = df['value'].diff()
+        df['acceleration'] = df['velocity'].diff()
+        
+        # 3. Statistical Deviations
+        # Distance from local mean normalized by local std (local z-score)
+        # Add epsilon to avoid division by zero
+        df['local_z'] = (df['value'] - df['rolling_mean']) / (df['rolling_std'] + 1e-6)
+        
+        # Fill NaN values (caused by windowing/diff)
+        # Backfill first, then fill remaining with 0
+        df = df.fillna(method='bfill').fillna(0)
+        
+        return df[['value', 'rolling_mean', 'rolling_std', 'velocity', 'acceleration', 'local_z']].values
+
     def train(self, sensor_type, data):
         if len(data) < self.min_train_size:
             return None
             
-        # Reshape for sklearn
-        X = np.array(data).reshape(-1, 1)
+        # Extract features
+        X = self.extract_features(data)
+        
         model = IsolationForest(contamination=0.05, random_state=42)
         model.fit(X)
         self.models[sensor_type] = model
         logger.info(f"Retrained model for {sensor_type} with {len(data)} samples")
         
-    def predict(self, sensor_type, value):
+    def predict(self, sensor_type):
         if sensor_type not in self.models:
-            return 0 # Unknown status (could treat as normal or pending)
+            return 0 # Unknown status
             
-        X = np.array([[value]])
+        data = self.data_buffers[sensor_type]
+        if len(data) < 15: # Need enough history for features
+            return 0
+            
+        # Get features for the most recent point
+        # We process the whole buffer to get correct rolling values for the last point
+        X_full = self.extract_features(data)
+        X_latest = X_full[-1].reshape(1, -1)
+        
         # Isolation Forest returns -1 for anomaly, 1 for normal
-        pred = self.models[sensor_type].predict(X)[0]
-        return 1 if pred == -1 else 0 # Return 1 if anomaly, 0 if normal
+        pred = self.models[sensor_type].predict(X_latest)[0]
+        return 1 if pred == -1 else 0
 
     def update(self, sensor_type, value):
         if sensor_type not in self.data_buffers:
@@ -95,7 +138,7 @@ class AnomalyDetector:
         if sensor_type not in self.models or len(self.data_buffers[sensor_type]) % 100 == 0:
             self.train(sensor_type, self.data_buffers[sensor_type])
             
-        return self.predict(sensor_type, value)
+        return self.predict(sensor_type)
 
 def main():
     consumer, producer = create_kafka_client()
@@ -114,6 +157,7 @@ def main():
         value = record.get('value')
         
         if sensor_type and value is not None:
+            # Update detector with new value
             is_anomaly = detector.update(sensor_type, value)
             
             record['is_anomaly'] = int(is_anomaly)
