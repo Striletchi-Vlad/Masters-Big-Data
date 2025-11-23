@@ -1,0 +1,5 @@
+streamlit
+plotly
+kafka-python
+pandas
+hdfs

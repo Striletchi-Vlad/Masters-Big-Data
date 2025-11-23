@@ -1,0 +1,6 @@
+kafka-python
+scikit-learn
+numpy
+pandas
+hdfs
+requests
