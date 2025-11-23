@@ -1,0 +1,5 @@
+Vlad: dashboard
+Mihai: producers
+Darius: predictor
+
+- the rest was done as a joint effort
